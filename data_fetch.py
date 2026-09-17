@@ -17,6 +17,7 @@ to describe whether the curve is upward-sloping (normal), roughly flat, or
 inverted.
 """
 
+import csv
 from io import StringIO
 
 import pandas as pd
@@ -111,17 +112,47 @@ def fetch_boe_yield_data(start_date: str = "01/Jan/2000") -> pd.DataFrame:
             "https://www.bankofengland.co.uk/boeapps/database/ manually."
         )
 
+    expected_fields = len(BOE_SERIES) + 1  # date + one column per series
+
     try:
-        df = pd.read_csv(StringIO(text))
+        rows = list(csv.reader(StringIO(text)))
     except Exception as exc:  # noqa: BLE001 - surface any parse failure clearly
         raise BoEDataError(f"Could not parse the response as CSV: {exc}") from exc
 
-    if df.shape[1] < len(BOE_SERIES) + 1:
+    # The BoE's export puts a handful of metadata lines (title, notes, series
+    # codes echoed back, etc.) ahead of the actual data table, and those lines
+    # don't have the same number of fields as the real rows. Rather than
+    # guessing how many lines to skip, find where a *run* of same-width rows
+    # begins - that's the real header + data - and drop everything else
+    # (preamble above it, stray footnotes below it).
+    header_idx = None
+    for i, row in enumerate(rows):
+        if not any(cell.strip() for cell in row):
+            continue
+        if len(row) != expected_fields:
+            continue
+        following = [r for r in rows[i + 1 : i + 4] if any(cell.strip() for cell in r)]
+        if following and all(len(r) == expected_fields for r in following):
+            header_idx = i
+            break
+
+    if header_idx is None:
         raise BoEDataError(
-            f"Expected {len(BOE_SERIES) + 1} columns (date + "
-            f"{len(BOE_SERIES)} series) but got {df.shape[1]}. The Bank of "
-            "England's export format may have changed."
+            f"Couldn't find a row of {expected_fields} consistent columns "
+            "(date + 4 series) anywhere in the response. The Bank of "
+            "England's export format has probably changed shape."
         )
+
+    table_rows = [r for r in rows[header_idx:] if len(r) == expected_fields]
+    header, data_rows = table_rows[0], table_rows[1:]
+
+    if not data_rows:
+        raise BoEDataError(
+            "Found a header row but no data rows after it - the response "
+            "may have been truncated or the date range returned nothing."
+        )
+
+    df = pd.DataFrame(data_rows, columns=header)
 
     # First column is always the date; the rest line up positionally with
     # the series codes in the order we requested them.
