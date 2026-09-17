@@ -24,6 +24,20 @@ import requests
 
 BOE_URL = "https://www.bankofengland.co.uk/boeapps/database/_iadb-fromshowcolumns.asp"
 
+# The Bank of England's site blocks requests that don't look like they came
+# from a real browser (Streamlit Cloud's default `requests` User-Agent gets a
+# 403). These headers make the request look like an ordinary browser visit to
+# the database page.
+BOE_HEADERS = {
+    "User-Agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+        "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
+    ),
+    "Accept": "text/csv,text/plain,text/html,application/xhtml+xml,*/*;q=0.8",
+    "Accept-Language": "en-GB,en;q=0.9",
+    "Referer": "https://www.bankofengland.co.uk/boeapps/database/",
+}
+
 # Order matters: the BoE CSV export returns columns in the same order the
 # series codes were requested in, so we zip them positionally rather than
 # trusting exact header text (which can be either the code or a long title
@@ -66,8 +80,22 @@ def fetch_boe_yield_data(start_date: str = "01/Jan/2000") -> pd.DataFrame:
     }
 
     try:
-        resp = requests.get(BOE_URL, params=params, timeout=30)
+        resp = requests.get(BOE_URL, params=params, headers=BOE_HEADERS, timeout=30)
         resp.raise_for_status()
+    except requests.HTTPError as exc:
+        status = exc.response.status_code if exc.response is not None else None
+        if status == 403:
+            raise BoEDataError(
+                "The Bank of England site returned 403 Forbidden - it's blocking "
+                "this request as non-browser traffic. This usually clears up with "
+                "browser-like request headers; if you're still seeing this after "
+                "a redeploy, the site may have tightened its bot-blocking further "
+                "and the headers need updating again."
+            ) from exc
+        raise BoEDataError(
+            f"The Bank of England site returned an error (HTTP {status}). "
+            f"Underlying error: {exc}"
+        ) from exc
     except requests.RequestException as exc:
         raise BoEDataError(
             "Could not reach the Bank of England statistics database. "
