@@ -14,12 +14,14 @@ import streamlit as st
 from data_fetch import BoEDataError, MATURITY_YEARS, fetch_boe_yield_data
 from model import (
     SHAPE_LABELS,
+    backtest_trading_strategy,
     build_features,
     build_labels,
     chrono_train_test_split,
     classify_shape,
     evaluate,
     predict_latest,
+    strategy_stats,
     train_model,
 )
 
@@ -268,6 +270,80 @@ with b2:
     st.caption(
         "The model should beat the persistence baseline to be worth anything - "
         "if it doesn't, today's shape is already your best guess."
+    )
+
+st.divider()
+
+# ---------------- Trading signal backtest ----------------
+st.subheader("Trading signal backtest")
+st.caption(
+    "Illustrative only: a unit-notional, duration-unweighted, cost-free "
+    "curve-steepener position sized off the shape call (+1 long steepener on "
+    "'Normal', -1 short/long-flattener on 'Inverted', 0 on 'Flat'), marked to "
+    "market daily against the next day's change in the 20y-minus-Bank-Rate "
+    "spread. This measures whether the *signal* has edge on the spread's "
+    "direction - it is not a real tradeable P&L (no transaction costs, no "
+    "DV01/duration weighting, no realistic sizing)."
+)
+
+trade_df = backtest_trading_strategy(test_df, backtest.y_pred_model, threshold_pp)
+
+STRAT_COLORS = {"Model": COL_Y5, "Persistence": COL_Y10, "Always long steepener": COL_Y20}
+
+t1, t2 = st.columns([3, 1])
+with t1:
+    pnl_fig = go.Figure()
+    pnl_fig.add_trace(
+        go.Scatter(
+            x=trade_df["date"],
+            y=trade_df["cum_pnl_model"],
+            mode="lines",
+            line=dict(color=STRAT_COLORS["Model"], width=2),
+            name="Model",
+            hovertemplate="%{x|%d %b %Y}: %{y:+.2f}pp<extra>Model</extra>",
+        )
+    )
+    pnl_fig.add_trace(
+        go.Scatter(
+            x=trade_df["date"],
+            y=trade_df["cum_pnl_persistence"],
+            mode="lines",
+            line=dict(color=STRAT_COLORS["Persistence"], width=2),
+            name="Persistence",
+            hovertemplate="%{x|%d %b %Y}: %{y:+.2f}pp<extra>Persistence</extra>",
+        )
+    )
+    pnl_fig.add_trace(
+        go.Scatter(
+            x=trade_df["date"],
+            y=trade_df["cum_pnl_always_long"],
+            mode="lines",
+            line=dict(color=STRAT_COLORS["Always long steepener"], width=2, dash="dot"),
+            name="Always long steepener",
+            hovertemplate="%{x|%d %b %Y}: %{y:+.2f}pp<extra>Always long</extra>",
+        )
+    )
+    pnl_fig.add_hline(y=0, line=dict(color="#898781", width=1))
+    pnl_fig.update_layout(
+        xaxis_title=None,
+        yaxis_title="Cumulative P&L (pp, notional unit position)",
+        height=340,
+        margin=dict(l=10, r=10, t=10, b=10),
+        legend=dict(orientation="h", yanchor="bottom", y=1.02),
+    )
+    st.plotly_chart(pnl_fig, width="stretch")
+
+with t2:
+    model_stats = strategy_stats(trade_df["pnl_model"], trade_df["model_signal"] != 0)
+    persistence_stats = strategy_stats(trade_df["pnl_persistence"], trade_df["persistence_signal"] != 0)
+    always_long_stats = strategy_stats(trade_df["pnl_always_long"])
+
+    st.metric("Model total P&L", f"{model_stats['total_pnl']:+.2f}pp")
+    st.metric("Model Sharpe (annualised)", f"{model_stats['sharpe']:.2f}")
+    st.metric("Model hit rate (when trading)", f"{model_stats['hit_rate']:.0%}")
+    st.caption(
+        f"Persistence Sharpe: {persistence_stats['sharpe']:.2f} · "
+        f"Always-long Sharpe: {always_long_stats['sharpe']:.2f}"
     )
 
 with st.expander("Raw recent data"):
