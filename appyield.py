@@ -13,15 +13,21 @@ import streamlit as st
 
 from data_fetch import BoEDataError, MATURITY_YEARS, fetch_boe_yield_data
 from model import (
+    FORECAST_QUANTILES,
     SHAPE_LABELS,
     backtest_trading_strategy,
     build_features,
     build_labels,
+    build_level_labels,
     chrono_train_test_split,
+    chrono_train_test_split_levels,
     classify_shape,
     evaluate,
+    forecast_backtest_coverage,
+    forecast_quantiles,
     predict_latest,
     strategy_stats,
+    train_forecast_models,
     train_model,
 )
 
@@ -116,7 +122,22 @@ if model is None:
     st.warning("Not enough labelled history yet to train and backtest a model for this horizon.")
     st.stop()
 
-latest_date = raw["date"].iloc[-1].date()
+level_labelled = build_level_labels(featured, horizon_days=horizon_days)
+
+
+@st.cache_resource(show_spinner="Training forecast models...")
+def get_forecast_models(_level_labelled: pd.DataFrame, horizon: int):
+    train_df, test_df = chrono_train_test_split_levels(_level_labelled)
+    if len(train_df) < 150 or len(test_df) < 20:
+        return None, None
+    models = train_forecast_models(train_df)
+    return models, test_df
+
+
+forecast_models, forecast_test_df = get_forecast_models(level_labelled, horizon_days)
+
+latest_date_ts = raw["date"].iloc[-1]
+latest_date = latest_date_ts.date()
 latest = raw.iloc[-1]
 current_total_spread = latest["y20"] - latest["bank_rate"]
 current_shape = classify_shape(current_total_spread, threshold_pp)
@@ -231,6 +252,140 @@ with right:
         margin=dict(l=10, r=10, t=10, b=10),
     )
     st.plotly_chart(imp_fig, width="stretch")
+
+st.divider()
+
+# ---------------- AI forecast: fan chart + projected curve ----------------
+st.subheader("AI forecast: where the curve is heading")
+
+if forecast_models is None:
+    st.info("Not enough labelled history yet to train the forecast models for this horizon.")
+else:
+    forecast_date = latest_date_ts + pd.tseries.offsets.BDay(horizon_days)
+    quantiles = forecast_quantiles(forecast_models, featured.iloc[[-1]])
+    coverage = forecast_backtest_coverage(forecast_models, forecast_test_df, target="total_spread")
+    q_lo, q_med, q_hi = FORECAST_QUANTILES
+
+    fcol1, fcol2 = st.columns([3, 2])
+
+    with fcol1:
+        st.caption(
+            f"Gradient-boosted quantile regression, projecting from today "
+            f"({latest_date.isoformat()}) to {forecast_date.date().isoformat()} "
+            f"(+{horizon_days} business days). Styled after the Bank of "
+            "England's own fan charts - the shaded cone is the model's "
+            "10th-90th percentile uncertainty, not a single confident guess."
+        )
+        hist_window = featured.tail(150)
+        spread_q = quantiles["total_spread"]
+
+        fan_fig = go.Figure()
+        fan_fig.add_trace(
+            go.Scatter(
+                x=hist_window["date"],
+                y=hist_window["total_spread"],
+                mode="lines",
+                line=dict(color=COL_Y10, width=2),
+                name="History",
+                hovertemplate="%{x|%d %b %Y}: %{y:+.2f}pp<extra></extra>",
+            )
+        )
+        cone_x = [latest_date_ts, forecast_date]
+        fan_fig.add_trace(
+            go.Scatter(
+                x=cone_x,
+                y=[current_total_spread, spread_q[q_hi]],
+                mode="lines",
+                line=dict(width=0),
+                showlegend=False,
+                hoverinfo="skip",
+            )
+        )
+        fan_fig.add_trace(
+            go.Scatter(
+                x=cone_x,
+                y=[current_total_spread, spread_q[q_lo]],
+                mode="lines",
+                line=dict(width=0),
+                fill="tonexty",
+                fillcolor="rgba(235,104,52,0.20)",
+                name=f"{q_lo:.0%}-{q_hi:.0%} forecast band",
+                hoverinfo="skip",
+            )
+        )
+        fan_fig.add_trace(
+            go.Scatter(
+                x=cone_x,
+                y=[current_total_spread, spread_q[q_med]],
+                mode="lines+markers",
+                line=dict(color=COL_Y10, width=2, dash="dash"),
+                marker=dict(size=7),
+                name="Median forecast",
+                hovertemplate="%{x|%d %b %Y}: %{y:+.2f}pp<extra></extra>",
+            )
+        )
+        fan_fig.add_hline(y=threshold_pp, line=dict(color="#c3c2b7", width=1, dash="dot"))
+        fan_fig.add_hline(y=-threshold_pp, line=dict(color="#c3c2b7", width=1, dash="dot"))
+        fan_fig.add_hline(y=0, line=dict(color="#898781", width=1))
+        fan_fig.update_layout(
+            xaxis_title=None,
+            yaxis_title="Total spread (pp)",
+            height=340,
+            margin=dict(l=10, r=10, t=10, b=10),
+            legend=dict(orientation="h", yanchor="bottom", y=1.02),
+        )
+        st.plotly_chart(fan_fig, width="stretch")
+        st.caption(
+            f"Calibration check (backtest): the actual value landed inside this "
+            f"band {coverage['coverage']:.0%} of the time, against a "
+            f"{coverage['target_coverage']:.0%} target ({coverage['n']} "
+            "out-of-sample observations). Well above target means the band's "
+            "overcautious; well below means it's overconfident and the cone "
+            "shouldn't be taken too literally."
+        )
+
+    with fcol2:
+        st.caption(f"Projected curve for {forecast_date.date().isoformat()}, with the same 10-90% band per point.")
+        curve_points = ["bank_rate", "y5", "y10", "y20"]
+        x_vals = [MATURITY_YEARS[c] for c in curve_points]
+        median_curve = [quantiles[c][q_med] for c in curve_points]
+        low_curve = [quantiles[c][q_lo] for c in curve_points]
+        high_curve = [quantiles[c][q_hi] for c in curve_points]
+        err_plus = [h - m for h, m in zip(high_curve, median_curve)]
+        err_minus = [m - l for m, l in zip(median_curve, low_curve)]
+
+        fcurve_fig = go.Figure()
+        fcurve_fig.add_trace(
+            go.Scatter(
+                x=x_vals,
+                y=[latest[c] for c in curve_points],
+                mode="lines+markers",
+                line=dict(color=COL_Y5, width=2),
+                marker=dict(size=8),
+                name="Today",
+                hovertemplate="%{x}y: %{y:.2f}%<extra>Today</extra>",
+            )
+        )
+        fcurve_fig.add_trace(
+            go.Scatter(
+                x=x_vals,
+                y=median_curve,
+                mode="lines+markers",
+                line=dict(color=COL_Y10, width=2, dash="dash"),
+                marker=dict(size=8),
+                name=f"+{horizon_days}d forecast",
+                error_y=dict(type="data", symmetric=False, array=err_plus, arrayminus=err_minus, color=COL_Y10),
+                hovertemplate="%{x}y: %{y:.2f}%<extra>Forecast</extra>",
+            )
+        )
+        fcurve_fig.update_layout(
+            xaxis_title="Maturity (years)",
+            yaxis_title="Yield (%)",
+            height=340,
+            margin=dict(l=10, r=10, t=10, b=10),
+            legend=dict(orientation="h", yanchor="bottom", y=1.02),
+        )
+        st.plotly_chart(fcurve_fig, width="stretch")
 
 st.divider()
 

@@ -21,7 +21,7 @@ from typing import Optional
 
 import numpy as np
 import pandas as pd
-from sklearn.ensemble import RandomForestClassifier
+from sklearn.ensemble import HistGradientBoostingRegressor, RandomForestClassifier
 from sklearn.metrics import accuracy_score, confusion_matrix
 
 SHAPE_LABELS = ["Inverted", "Flat", "Normal"]
@@ -185,6 +185,102 @@ def backtest_trading_strategy(
         d[f"cum_{col}"] = d[col].cumsum()
 
     return d
+
+
+FORECAST_TARGETS = ["bank_rate", "y5", "y10", "y20", "total_spread"]
+FORECAST_QUANTILES = (0.1, 0.5, 0.9)  # low / median / high
+
+
+def build_level_labels(d: pd.DataFrame, horizon_days: int) -> pd.DataFrame:
+    """
+    Attach the *actual future value*, horizon_days ahead, for each forecast
+    target - unlike build_labels, this predicts real numbers (a level
+    forecast) rather than a Normal/Flat/Inverted class.
+    """
+    d = d.copy()
+    for col in FORECAST_TARGETS:
+        d[f"future_{col}"] = d[col].shift(-horizon_days)
+    return d
+
+
+def chrono_train_test_split_levels(d: pd.DataFrame, test_frac: float = 0.15):
+    """Same chronological split as chrono_train_test_split, but for the level-forecast labels."""
+    future_cols = [f"future_{c}" for c in FORECAST_TARGETS]
+    labelled = d.dropna(subset=future_cols).reset_index(drop=True)
+    n = len(labelled)
+    split = int(n * (1 - test_frac))
+    return labelled.iloc[:split].copy(), labelled.iloc[split:].copy()
+
+
+def train_forecast_models(train_df: pd.DataFrame) -> dict:
+    """
+    Train low/median/high quantile-regression models for every forecast
+    target. Gradient-boosted quantile regressors give an honest uncertainty
+    band instead of a single point guess - a wide band means the model
+    itself isn't confident, which is the whole point of showing it as a fan
+    chart rather than a single forecast line.
+
+    Returns {target: {quantile: fitted_model}}.
+
+    Uses HistGradientBoostingRegressor (histogram-based, much faster to
+    train than the plain GradientBoostingRegressor for this many rows) since
+    this trains 5 targets x 3 quantiles = 15 models every time the horizon
+    slider changes, inside a free-tier Streamlit Cloud instance.
+    """
+    X = train_df[FEATURE_COLS]
+    models_by_target = {}
+    for target in FORECAST_TARGETS:
+        y = train_df[f"future_{target}"]
+        models_by_target[target] = {}
+        for q in FORECAST_QUANTILES:
+            hgb = HistGradientBoostingRegressor(
+                loss="quantile",
+                quantile=q,
+                max_iter=150,
+                max_depth=3,
+                min_samples_leaf=15,
+                learning_rate=0.1,
+                random_state=42,
+            )
+            hgb.fit(X, y)
+            models_by_target[target][q] = hgb
+    return models_by_target
+
+
+def forecast_quantiles(models_by_target: dict, features_row: pd.DataFrame) -> dict:
+    """Predict {target: {quantile: value}} for a single row of features.
+
+    Each quantile is trained as a separate independent regressor, so nothing
+    guarantees low <= median <= high for a given prediction (a known quirk
+    of this approach) - sort them so the band never renders inverted.
+    """
+    X = features_row[FEATURE_COLS]
+    out = {}
+    for target, models in models_by_target.items():
+        raw = {q: float(m.predict(X)[0]) for q, m in models.items()}
+        sorted_vals = sorted(raw.values())
+        out[target] = dict(zip(sorted(raw.keys()), sorted_vals))
+    return out
+
+
+def forecast_backtest_coverage(models_by_target: dict, test_df: pd.DataFrame, target: str = "total_spread") -> dict:
+    """
+    Calibration check: in the out-of-sample period, what fraction of the
+    time did the actual future value fall inside the model's 10th-90th
+    percentile band? For a well-calibrated model this should land near 80%.
+    Far above -> the band is too wide (overcautious). Far below -> the band
+    is too narrow (overconfident) and shouldn't be trusted at face value.
+    """
+    X = test_df[FEATURE_COLS]
+    actual = test_df[f"future_{target}"]
+    low = models_by_target[target][FORECAST_QUANTILES[0]].predict(X)
+    high = models_by_target[target][FORECAST_QUANTILES[-1]].predict(X)
+    covered = (actual >= low) & (actual <= high)
+    return {
+        "coverage": float(covered.mean()),
+        "target_coverage": FORECAST_QUANTILES[-1] - FORECAST_QUANTILES[0],
+        "n": int(len(actual)),
+    }
 
 
 def strategy_stats(pnl: pd.Series, in_position: Optional[pd.Series] = None) -> dict:
